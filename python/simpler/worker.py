@@ -81,7 +81,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
@@ -3394,6 +3394,53 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, device_id: int) -> Non
     prepared.add(cid)
 
 
+class _ChipServiceContext:
+    """Chip-local DEVICE_MALLOC backings borrowed by a startup service.
+
+    The parent retains the canonical Buffer before sending its descriptor to the
+    service. Pins also fence this chip's allocator; they do not fence computation.
+    """
+
+    def __init__(self, owner_instance_id: bytes, worker_id: int) -> None:
+        self.owner_instance_id = owner_instance_id
+        self.worker_id = worker_id
+        self._allocations: dict[int, int] = {}
+        self._pins: dict[str, BufferDescriptor] = {}
+        self._lock = threading.Lock()
+
+    def record(self, address: int, size: int) -> None:
+        with self._lock:
+            self._allocations[address] = size
+
+    def pin(self, token: str, descriptor: BufferDescriptor) -> tuple[int, int]:
+        with self._lock:
+            if not token or token in self._pins:
+                raise ValueError("chip service: invalid or duplicate registration token")
+            address = int.from_bytes(descriptor.body, "little")
+            if (
+                descriptor.identity.owner_instance_id != self.owner_instance_id
+                or descriptor.backend_kind is not BackendKind.DEVICE_MALLOC
+                or descriptor.address_space is not AddressSpace.DEVICE
+                or self._allocations.get(address) != descriptor.nbytes
+            ):
+                raise ValueError("chip service: descriptor does not name a live local allocation")
+            self._pins[token] = descriptor
+            return address, int(descriptor.nbytes)
+
+    def unpin(self, token: str) -> None:
+        with self._lock:
+            if token not in self._pins:
+                raise ValueError("chip service: unknown registration token")
+            del self._pins[token]
+
+    def free(self, address: int, release: Callable[[int], None]) -> None:
+        with self._lock:
+            if any(int.from_bytes(desc.body, "little") == address for desc in self._pins.values()):
+                raise RuntimeError("chip service still holds this allocation")
+            release(address)
+            self._allocations.pop(address, None)
+
+
 def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every dependency the handlers close over crosses the fork as an explicit arg, and the control handler carries one branch per sub-command
     cw: _ChipWorker,
     buf: memoryview,
@@ -3413,6 +3460,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     chip_rank: int | None = None,
     provider_region_store: ProviderRegionStore,
     reports_admissible_sets: bool = False,
+    service_context: _ChipServiceContext | None = None,
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
 
@@ -3581,10 +3629,15 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             if sub_cmd == _CTRL_MALLOC:
                 size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                 ptr = cw.malloc(size)
+                if service_context is not None:
+                    service_context.record(ptr, size)
                 struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
             elif sub_cmd == _CTRL_FREE:
                 ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                cw.free(ptr)
+                if service_context is None:
+                    cw.free(ptr)
+                else:
+                    service_context.free(ptr, cw.free)
             elif sub_cmd in (_CTRL_COPY_TO, _CTRL_COPY_FROM):
                 # Both ends resolve through the same map-once cache the task-args path uses, so a
                 # backing already imported for a task is the one this copy reaches. The offset is
@@ -4197,6 +4250,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     collect_across_runs: bool = False,
     pipeline_depth_request: int = 0,
     automatic_admission: bool = False,
+    service_factory: Callable[..., Any] | None = None,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -4258,7 +4312,12 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     # before it dispatches. The parent therefore issues no post-READY
     # control_prepare for the initial snapshot.
     prepared: set[int] = set()
+    service = None
+    service_context = None
     try:
+        if service_factory is not None:
+            service_context = _ChipServiceContext(owner_instance_id, int(chip_rank))
+            service = service_factory(service_context)
         for cid, target in registry.items():
             if isinstance(target, ChipCallable):
                 _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
@@ -4266,6 +4325,8 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+        if service is not None:
+            service.close()
         # This branch already owns a real device teardown, and the child exits
         # normally from it, so its observation is publishable — the same
         # finalize-then-publish shape the main loop's exit uses.
@@ -4325,8 +4386,11 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_rank=chip_rank,
             provider_region_store=provider_region_store,
             reports_admissible_sets=reports_admissible_sets,
+            service_context=service_context,
         )
     finally:
+        if service is not None:
+            service.close()
         # After the teardown, whether or not it raised: the C++ side captured
         # its observation before throwing, and the parent's shared mailbox
         # outlives this process.
@@ -5542,6 +5606,7 @@ class Worker:
         # type nor a stale alias can reach any later stage; the budget's value
         # range and supported routes are checked where the route is known.
         self._config = _config_with_valid_workspace_budget_shape(_adopt_canonical_collect_across_runs(config))
+        self._init_chip_services(self._config)
         self._callable_registry: dict[int, Any] = {}
         self._identity_registry: dict[bytes, _CallableIdentityState] = {}
         self._live_handles: dict[int, bytes] = {}
@@ -9270,6 +9335,7 @@ class Worker:
                             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
                             pipeline_depth_request=chip_pipeline_depth_request,
                             automatic_admission=self._automatic_admission_requested,
+                            service_factory=self._chip_service_factories.get(idx),
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -12077,6 +12143,9 @@ class Worker:
                 # one chip no longer blocks provenance or device ops on another.
                 with self._child_prov_lock:
                     registered = self._require_freeable(handle, api="free")
+                    with self._hierarchical_start_cv:
+                        if any(item.identity == handle.identity for item in self._service_buffers.values()):
+                            raise RuntimeError("Worker.free: chip service still retains this allocation")
                     ptr = int(registered.base)
                     self._drop_device_alloc(handle.identity)
                 if self.level == 2:
@@ -12085,6 +12154,48 @@ class Worker:
                 else:
                     assert self._worker is not None
                     self._worker.free(wid, ptr)
+
+    def _init_chip_services(self, config: dict[str, Any]) -> None:
+        services = dict(config.get("chip_service_factories") or {})
+        if services and (
+            self.level != 3
+            or any(
+                type(rank) is not int or not 0 <= rank < len(config.get("device_ids", ())) or not callable(factory)
+                for rank, factory in services.items()
+            )
+        ):
+            raise ValueError("chip_service_factories requires callable factories indexed by local L3 chip rank")
+        self._chip_service_factories = services
+        self._service_buffers: dict[str, Buffer] = {}
+
+    def retain_service_buffer(self, handle: Buffer) -> tuple[str, BufferDescriptor]:
+        """Retain one L3 DEVICE_MALLOC allocation until its service unregisters it.
+
+        This protects allocation lifetime only. The service's caller must order
+        reads and writes against computation and release only after native access ends.
+        """
+        if self.level != 3:
+            raise ValueError("retain_service_buffer requires an L3 chip allocation")
+        wid = self._device_worker_for(handle.identity, api="retain_service_buffer")
+        with self._operation_lease("retain_service_buffer"), self._child_prov_worker_lock(wid):
+            with self._child_prov_lock:
+                registered = self._require_freeable(handle, api="retain_service_buffer")
+                descriptor = registered.to_descriptor()
+                if handle.to_descriptor() != descriptor or handle.owner_worker_id != registered.owner_worker_id:
+                    raise ValueError("retain_service_buffer: modified allocation descriptor")
+                token = uuid.uuid4().hex
+                with self._hierarchical_start_cv:
+                    if self._lifecycle is not _Lifecycle.READY:
+                        raise RuntimeError("retain_service_buffer: worker is closing")
+                    self._service_buffers[token] = registered
+                return token, descriptor
+
+    def release_service_buffer(self, token: str) -> None:
+        """Drop a registration retain after the chip service confirms unregister."""
+        with self._hierarchical_start_cv:
+            if token not in self._service_buffers:
+                raise ValueError("release_service_buffer: unknown registration token")
+            del self._service_buffers[token]
 
     def committed_device_memory(self, worker_id: int = 0) -> int:
         """Total device HBM (bytes) committed by chip worker *worker_id*'s
@@ -13644,6 +13755,8 @@ class Worker:
         handles_to_drain: tuple[RunHandle, ...] = ()
         try:
             with self._hierarchical_start_cv:
+                if self._service_buffers:
+                    raise RuntimeError("chip service buffers must be unregistered before worker close")
                 if threading.get_ident() in self._lease_depth:
                     raise RuntimeError(
                         "Worker.close(): cannot be called from within a run() / submit() / create_buffer() / "
